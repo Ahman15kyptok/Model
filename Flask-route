@@ -1,0 +1,179 @@
+from flask import Flask, jsonify, request, render_template, send_file
+from flask_mysqldb import MySQL
+import requests
+from openpyxl import Workbook
+from flask import session, redirect, url_for, flash
+import bcrypt
+from werkzeug.security import check_password_hash
+
+app = Flask(__name__)
+
+
+app.config['MYSQL_HOST'] = 'localhost'
+app.config['MYSQL_USER'] = 'root'
+app.config['MYSQL_PASSWORD'] = '1234'
+app.config['MYSQL_DB'] = "b'ahmansdb'"
+
+mysql = MySQL(app)
+
+YANDEX_API_KEY = "AQVN3f2Jq4MLWV1ZPtxyn-4CsY82Hd4FrslLNIPj"
+FOLDER_ID = "b1g7gi5la2r4fg3l0nav"
+
+@app.route('/')
+def home():
+    return render_template('login.html')
+
+@app.route('/run-recommendation', methods=['POST'])
+def run_recommendation():
+    data = request.get_json()
+    project_name = data.get('project_name', '')
+    cur = mysql.connection.cursor()
+    query = """
+    SELECT 
+        u.id,
+        u.first_name, 
+        u.last_name, 
+        u.academic_rank, 
+        u.experience,
+        u.tracking_experience,
+        u.business_experience,
+        GROUP_CONCAT(ct.name_of_certificate_type SEPARATOR '; ') AS certificates
+    FROM users u
+    LEFT JOIN certificates c ON u.id = c.users_id
+    LEFT JOIN certificate_type ct ON c.certificate_type_id_certificate_type = ct.id_certificate_type
+    GROUP BY u.id
+    LIMIT 20
+    """
+    cur.execute(query)
+    users = cur.fetchall()
+    columns = [desc[0] for desc in cur.description]
+    cur.close()
+    user_list = ""
+    for row in users:
+        user_data = dict(zip(columns, row))
+        user_list += (
+            f"Имя: {user_data['first_name']} {user_data['last_name']}, "
+            f"Академическая степень: {user_data['academic_rank']}, "
+            f"Опыт: {user_data['experience']}, "
+            f"Трекерский опыт: {user_data['tracking_experience']}, "
+            f"Бизнес-опыт: {user_data['business_experience']}, "
+            f"Сертификаты: {user_data['certificates'] or 'нет'}\n"
+        )
+    user_message = f"Вот список пользователей с их данными и сертификатами, если пользователь имеет сертификат 'Трекер' то он и является трекером и так же с остальными сертификатами в ответе делай акцент на трекеров,то есть вам подходит данный трекер на проект :\n\n{user_list}\nКто из них лучше всего подходит для проекта: {project_name}?"
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "modelUri": f"gpt://{FOLDER_ID}/yandexgpt/latest",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.7,
+            "maxTokens": 500
+        },
+        "messages": [
+            {"role": "user", "text": user_message}
+        ]
+    }
+
+    try:
+        response = requests.post(
+            "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+            headers=headers,
+            json=body
+        )
+        result_text = response.json()['result']['alternatives'][0]['message']['text']
+    except Exception as e:
+        result_text = f"Ошибка запроса: {e}"
+
+    return jsonify({'result': result_text})
+
+@app.route('/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    data = request.get_json()
+    first_name = data.get('first_name')
+    last_name = data.get('last_name')
+    academic_rank = data.get('academic_rank')
+    experience = data.get('experience')
+
+    cur = mysql.connection.cursor()
+    cur.execute("""
+            UPDATE users
+            SET first_name=%s, last_name=%s, academic_rank=%s, experience=%s
+            WHERE id=%s
+        """, (first_name, last_name, academic_rank, experience, user_id))
+    mysql.connection.commit()
+    cur.close()
+
+    return jsonify({'message': 'Пользователь обновлён'})
+
+@app.route('/users', methods=['POST'])
+def create_user():
+    data = request.get_json()
+    first_name = data.get('first_name')
+    last_name = data.get('last_name')
+    academic_rank = data.get('academic_rank')
+    experience = data.get('experience')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not (email and password):
+        return jsonify({'error': 'Email и пароль обязательны'}), 400
+
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        INSERT INTO users (first_name, last_name, academic_rank, experience, email, password)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (first_name, last_name, academic_rank, experience, email, hashed_password))
+    mysql.connection.commit()
+    cur.close()
+
+    return jsonify({'message': 'Пользователь добавлен'}), 201
+
+@app.route('/users/<int:user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    cur = mysql.connection.cursor()
+    cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    mysql.connection.commit()
+    cur.close()
+
+    return jsonify({'message': 'Пользователь удалён'})
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+
+    cur = mysql.connection.cursor()
+
+    query = """
+        SELECT u.id, u.password, c.certificate_type_id_certificate_type
+        FROM users u
+        LEFT JOIN certificates c ON u.id = c.users_id
+        WHERE u.email = %s
+    """
+    cur.execute(query, (email,))
+    rows = cur.fetchall()
+    cur.close()
+
+    if not rows:
+        return {"error": "Пользователь не найден"}, 401
+
+    user_id, hashed_password, _ = rows[0]
+
+    if not check_password_hash(hashed_password, password):
+        return {"error": "Неверный пароль"}, 401
+
+    cert_types = [row[2] for row in rows if row[2] is not None]
+
+    role = "user"
+    if 14 in cert_types:
+        role = "admin"
+
+    return {"role": role, "user_id": user_id}
+
+if __name__ == '__main__':
+    app.run(debug=True)
