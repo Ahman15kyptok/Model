@@ -16,7 +16,7 @@ app.config['MYSQL_DB'] = "b'ahmansdb'"
 
 mysql = MySQL(app)
 
-YANDEX_API_KEY = "AQVN3f2Jq4MLWV1ZPtxyn-4CsY82Hd4FrslLNIPj"
+YANDEX_API_KEY = ""
 FOLDER_ID = "b1g7gi5la2r4fg3l0nav"
 
 @app.route('/')
